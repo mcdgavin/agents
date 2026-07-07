@@ -21,7 +21,7 @@ class RedactionSink(enum.Enum):
     TELEMETRY = "telemetry"
     """Chat content written to telemetry spans/logs. Not wired yet."""
     TRANSCRIPT = "transcript"
-    """Chat history serialized or uploaded at session end. Not wired yet."""
+    """Chat history persisted at session end (session report dump and cloud upload)."""
 
 
 @dataclass
@@ -170,6 +170,13 @@ async def _redact_text(text: str, opts: RedactionOptions, ctx: RedactionContext)
             extra={"sink": ctx.sink.value},
         )
         return REDACTION_FAILURE_MARKER
+
+
+async def redact_text(
+    text: str, opts: RedactionOptions, *, sink: RedactionSink, role: str | None = None
+) -> str:
+    """Redact a single string for ``sink``, failing closed on redactor errors."""
+    return await _redact_text(text, opts, RedactionContext(sink=sink, role=role))
 
 
 async def redact_chat_ctx(

@@ -70,7 +70,62 @@ if TYPE_CHECKING:
     from .ipc.inference_executor import InferenceExecutor
     from .simulation import SimulationContext
     from .voice.agent_session import AgentSession, RecordingOptions
+    from .voice.events import AgentEvent
+    from .voice.redaction import RedactionOptions
     from .voice.report import SessionReport
+
+
+async def _redact_report_events(
+    events: list[AgentEvent], redaction: RedactionOptions
+) -> list[AgentEvent]:
+    """Redact the content-bearing session events for the transcript sink.
+
+    Returns a new list with redacted copies; the input events (i.e. the ones the
+    session recorded in memory) are untouched.
+    """
+    from .llm import ChatContext
+    from .voice.redaction import RedactionSink, redact_chat_ctx, redact_text
+
+    sink = RedactionSink.TRANSCRIPT
+    redacted: list[AgentEvent] = []
+    for ev in events:
+        if ev.type == "user_input_transcribed":
+            ev = ev.model_copy(
+                update={
+                    "transcript": await redact_text(
+                        ev.transcript, redaction, sink=sink, role="user"
+                    )
+                }
+            )
+        elif ev.type == "conversation_item_added" and ev.item.type == "message":
+            redacted_ctx = await redact_chat_ctx(ChatContext([ev.item]), redaction, sink=sink)
+            ev = ev.model_copy(update={"item": redacted_ctx.items[0]})
+        elif ev.type == "function_tools_executed":
+            calls = [
+                fc.model_copy(
+                    update={
+                        "arguments": await redact_text(
+                            fc.arguments, redaction, sink=sink, role="tool"
+                        )
+                    }
+                )
+                for fc in ev.function_calls
+            ]
+            outputs = [
+                out
+                if out is None
+                else out.model_copy(
+                    update={
+                        "output": await redact_text(out.output, redaction, sink=sink, role="tool")
+                    }
+                )
+                for out in ev.function_call_outputs
+            ]
+            ev = ev.model_copy(update={"function_calls": calls, "function_call_outputs": outputs})
+
+        redacted.append(ev)
+
+    return redacted
 
 
 @overload
@@ -283,6 +338,19 @@ class JobContext:
             await recorder_io.aclose()
 
         report = self.make_session_report(session)
+
+        from .voice.redaction import RedactionSink, redact_chat_ctx
+
+        # redact the transcript at the persistence egress: applied before both the
+        # console dump and the cloud upload, while session.history keeps raw values.
+        # the events list only reaches the console dump today, but it carries the
+        # same content (transcripts, chat items, tool calls), so redact it alongside
+        redaction = session.options.redaction
+        if redaction is not None and RedactionSink.TRANSCRIPT in redaction.sinks:
+            report.chat_history = await redact_chat_ctx(
+                report.chat_history, redaction, sink=RedactionSink.TRANSCRIPT
+            )
+            report.events = await _redact_report_events(report.events, redaction)
 
         # console recording, dump data to a local file
         if c.enabled and c.record:
