@@ -85,7 +85,7 @@ from .generation import (
     update_expressive_instructions,
     update_instructions,
 )
-from .redaction import RedactionSink, redact_chat_ctx
+from .redaction import RedactionSink, redact_chat_ctx, redact_for_telemetry
 from .speech_handle import DEFAULT_INPUT_DETAILS, InputDetails, SpeechHandle
 from .tool_executor import _resolve_async_tool_options, _RunningTasks, _ToolExecutor
 from .turn import (
@@ -505,6 +505,10 @@ class AgentActivity(RecognitionHooks):
         if redaction is None or RedactionSink.LLM not in redaction.sinks:
             return chat_ctx
         return await redact_chat_ctx(chat_ctx, redaction, sink=RedactionSink.LLM)
+
+    async def _redact_for_telemetry(self, text: str, *, role: str | None = None) -> str:
+        """Redact text written into telemetry span attributes, when the sink is enabled."""
+        return await redact_for_telemetry(text, self._session.options.redaction, role=role)
 
     async def update_chat_ctx(
         self, chat_ctx: llm.ChatContext, *, exclude_invalid_function_calls: bool = True
@@ -2818,7 +2822,10 @@ class AgentActivity(RecognitionHooks):
                     forwarded_text = playback_ev.synchronized_transcript
             else:
                 forwarded_text = ""
-        current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, forwarded_text)
+        current_span.set_attribute(
+            trace_types.ATTR_RESPONSE_TEXT,
+            await self._redact_for_telemetry(forwarded_text, role="assistant"),
+        )
 
         if forwarded_text and add_to_chat_ctx:
             assistant_metrics: llm.MetricsReport = {}
@@ -2924,10 +2931,14 @@ class AgentActivity(RecognitionHooks):
                 if isinstance(instructions, Instructions)
                 else instructions
             )
-            current_span.set_attribute(trace_types.ATTR_INSTRUCTIONS, instr_trace)
+            current_span.set_attribute(
+                trace_types.ATTR_INSTRUCTIONS,
+                await self._redact_for_telemetry(instr_trace, role="system"),
+            )
         if new_message:
             current_span.set_attribute(
-                trace_types.ATTR_USER_INPUT, new_message.raw_text_content or ""
+                trace_types.ATTR_USER_INPUT,
+                await self._redact_for_telemetry(new_message.raw_text_content or "", role="user"),
             )
 
         if (room_io := self._session._room_io) and room_io.room.isconnected():
@@ -3006,6 +3017,7 @@ class AgentActivity(RecognitionHooks):
             model_settings=model_settings,
             model=self.llm.model if self.llm else None,
             provider=self.llm.provider if self.llm else None,
+            redaction=self._session.options.redaction,
         )
         tasks.append(llm_task)
 
@@ -3340,7 +3352,10 @@ class AgentActivity(RecognitionHooks):
             self._agent._chat_ctx.insert(msg)
             self._session._conversation_item_added(msg)
             speech_handle._item_added([msg])
-            current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, forwarded_text)
+            current_span.set_attribute(
+                trace_types.ATTR_RESPONSE_TEXT,
+                await self._redact_for_telemetry(forwarded_text, role="assistant"),
+            )
 
         if not speech_handle.interrupted and len(tool_output.output) > 0:
             self._session._update_agent_state("thinking")
@@ -3877,7 +3892,12 @@ class AgentActivity(RecognitionHooks):
         current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, speech_handle.interrupted)
         current_span.set_attribute(
             trace_types.ATTR_RESPONSE_FUNCTION_CALLS,
-            json.dumps([fnc.model_dump(exclude={"type", "created_at"}) for fnc in function_calls]),
+            await self._redact_for_telemetry(
+                json.dumps(
+                    [fnc.model_dump(exclude={"type", "created_at"}) for fnc in function_calls]
+                ),
+                role="assistant",
+            ),
         )
 
         # _process_messages handles its own playout waits and interrupt cleanup
@@ -3971,7 +3991,10 @@ class AgentActivity(RecognitionHooks):
             self._session._conversation_item_added(chat_msg)
 
         if trace_text_parts:
-            current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, "\n".join(trace_text_parts))
+            current_span.set_attribute(
+                trace_types.ATTR_RESPONSE_TEXT,
+                await self._redact_for_telemetry("\n".join(trace_text_parts), role="assistant"),
+            )
 
         # sync local chat ctx to the realtime server to remove any items the
         # model added but the user never heard (interrupted before we pulled

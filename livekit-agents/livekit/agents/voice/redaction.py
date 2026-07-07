@@ -19,7 +19,12 @@ class RedactionSink(enum.Enum):
     LLM = "llm"
     """Chat context sent to a (typically third-party) LLM."""
     TELEMETRY = "telemetry"
-    """Chat content written to telemetry spans/logs. Not wired yet."""
+    """Chat content written by core into telemetry span attributes and logs.
+
+    The ``gen_ai.*`` events on the LLM-request span mirror the exact payload
+    exchanged with the LLM, so they are redacted by the LLM sink, not this one;
+    enable both sinks for full span coverage.
+    """
     TRANSCRIPT = "transcript"
     """Chat history persisted at session end (session report dump and cloud upload)."""
 
@@ -177,6 +182,15 @@ async def redact_text(
 ) -> str:
     """Redact a single string for ``sink``, failing closed on redactor errors."""
     return await _redact_text(text, opts, RedactionContext(sink=sink, role=role))
+
+
+async def redact_for_telemetry(
+    text: str, opts: RedactionOptions | None, *, role: str | None = None
+) -> str:
+    """Redact ``text`` for the telemetry sink; pass-through when the sink is not enabled."""
+    if opts is None or RedactionSink.TELEMETRY not in opts.sinks:
+        return text
+    return await _redact_text(text, opts, RedactionContext(sink=RedactionSink.TELEMETRY, role=role))
 
 
 async def redact_chat_ctx(

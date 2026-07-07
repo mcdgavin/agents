@@ -22,6 +22,7 @@ from ...utils.participant import (
     wait_for_participant_attribute,
     wait_for_track_publication,
 )
+from ..redaction import REDACTION_FAILURE_MARKER, RedactionSink
 from .classifier import (
     AMD_PROMPT,
     HUMAN_SILENCE_THRESHOLD,
@@ -509,6 +510,14 @@ class AMD(EventEmitter[Literal["amd_prediction"]]):
 
     def _on_amd_prediction(self, result: AMDPredictionEvent) -> None:
         self._result = result
+
+        # sync callback: the async redactor cannot run here, so the transcript is
+        # withheld from telemetry entirely when the telemetry sink is enabled
+        transcript = result.transcript
+        redaction = self._session.options.redaction
+        if redaction is not None and RedactionSink.TELEMETRY in redaction.sinks:
+            transcript = REDACTION_FAILURE_MARKER
+
         logger.info(
             "amd prediction",
             extra={
@@ -516,7 +525,7 @@ class AMD(EventEmitter[Literal["amd_prediction"]]):
                 "reason": result.reason,
                 "speech_duration": result.speech_duration,
                 "delay": result.delay,
-                "transcript": result.transcript,
+                "transcript": transcript,
             },
         )
         if self._classifier:
@@ -531,7 +540,7 @@ class AMD(EventEmitter[Literal["amd_prediction"]]):
                     trace_types.ATTR_AMD_REASON: result.reason,
                     trace_types.ATTR_AMD_SPEECH_DURATION: result.speech_duration,
                     trace_types.ATTR_AMD_DELAY: result.delay,
-                    trace_types.ATTR_AMD_TRANSCRIPT: result.transcript,
+                    trace_types.ATTR_AMD_TRANSCRIPT: transcript,
                 }
             )
 

@@ -39,6 +39,7 @@ from .events import (
     UserTurnExceededEvent,
     _AgentBackchannelOpportunityEvent,
 )
+from .redaction import RedactionSink, redact_chat_ctx, redact_for_telemetry
 from .turn import (
     TurnDetectionEvent,
     TurnDetectionMode as TurnDetectionMode,
@@ -1182,7 +1183,12 @@ class AudioRecognition:
             if self._session.amd is not None:
                 self._session.amd._on_transcript(transcript)
 
-            extra: dict[str, Any] = {"user_transcript": transcript, "language": self._last_language}
+            extra: dict[str, Any] = {
+                "user_transcript": await redact_for_telemetry(
+                    transcript, self._session.options.redaction, role="user"
+                ),
+                "language": self._last_language,
+            }
             if self._last_speaking_time:
                 extra["transcript_delay"] = time.time() - self._last_speaking_time
             logger.debug("received user transcript", extra=extra)
@@ -1521,17 +1527,23 @@ class AudioRecognition:
                         ):
                             endpointing_delay = self._endpointing.max_delay
 
+                        eou_chat_ctx = llm.ChatContext(
+                            chat_ctx.items[-_EOU_MAX_HISTORY_TURNS:]
+                        ).copy(
+                            exclude_function_call=True,
+                            exclude_instructions=True,
+                            exclude_empty_message=True,
+                            exclude_handoff=True,
+                            exclude_config_update=True,
+                        )
+                        redaction = self._session.options.redaction
+                        if redaction is not None and RedactionSink.TELEMETRY in redaction.sinks:
+                            eou_chat_ctx = await redact_chat_ctx(
+                                eou_chat_ctx, redaction, sink=RedactionSink.TELEMETRY
+                            )
                         eou_span_attributes: dict[str, Any] = {
                             trace_types.ATTR_CHAT_CTX: json.dumps(
-                                llm.ChatContext(chat_ctx.items[-_EOU_MAX_HISTORY_TURNS:])
-                                .copy(
-                                    exclude_function_call=True,
-                                    exclude_instructions=True,
-                                    exclude_empty_message=True,
-                                    exclude_handoff=True,
-                                    exclude_config_update=True,
-                                )
-                                .to_dict(
+                                eou_chat_ctx.to_dict(
                                     exclude_audio=True,
                                     exclude_image=True,
                                     exclude_timestamp=True,
@@ -1674,7 +1686,9 @@ class AudioRecognition:
                 )
                 user_turn_span.set_attributes(
                     {
-                        trace_types.ATTR_USER_TRANSCRIPT: self._audio_transcript,
+                        trace_types.ATTR_USER_TRANSCRIPT: await redact_for_telemetry(
+                            self._audio_transcript, self._session.options.redaction, role="user"
+                        ),
                         trace_types.ATTR_TRANSCRIPT_CONFIDENCE: confidence_avg,
                         trace_types.ATTR_TRANSCRIPTION_DELAY: metrics.transcription_delay or 0,
                         trace_types.ATTR_END_OF_TURN_DELAY: metrics.end_of_turn_delay or 0,

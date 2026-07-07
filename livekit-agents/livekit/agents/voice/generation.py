@@ -33,6 +33,7 @@ from ..types import (
 from ..utils import aio
 from ..utils.aio import itertools
 from . import io
+from .redaction import RedactionOptions, RedactionSink, redact_chat_ctx, redact_for_telemetry
 from .speech_handle import SpeechHandle
 from .tool_executor import _build_executor_map
 from .transcription.text_transforms import _apply_text_transforms
@@ -150,12 +151,15 @@ def perform_llm_inference(
     model_settings: ModelSettings,
     model: str | None = None,
     provider: str | None = None,
+    redaction: RedactionOptions | None = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
     text_ch = aio.Chan[str | FlushSentinel]()
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
-        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data, model, provider)
+        _llm_inference_task(
+            node, chat_ctx, tool_ctx, model_settings, data, model, provider, redaction
+        )
     )
     llm_task.add_done_callback(lambda _: text_ch.close())
     llm_task.add_done_callback(lambda _: function_ch.close())
@@ -179,6 +183,7 @@ async def _llm_inference_task(
     data: _LLMGenerationData,
     model: str | None = None,
     provider: str | None = None,
+    redaction: RedactionOptions | None = None,
 ) -> bool:
     start_time = time.perf_counter()
     current_span = trace.get_current_span()
@@ -187,9 +192,13 @@ async def _llm_inference_task(
     text_ch, function_ch = data.text_ch, data.function_ch
     tools = tool_ctx.flatten()
 
+    trace_chat_ctx = chat_ctx
+    if redaction is not None and RedactionSink.TELEMETRY in redaction.sinks:
+        trace_chat_ctx = await redact_chat_ctx(chat_ctx, redaction, sink=RedactionSink.TELEMETRY)
+
     attrs: dict[str, Any] = {
         trace_types.ATTR_CHAT_CTX: json.dumps(
-            chat_ctx.to_dict(
+            trace_chat_ctx.to_dict(
                 exclude_audio=True,
                 exclude_image=True,
                 exclude_timestamp=True,
@@ -221,7 +230,10 @@ async def _llm_inference_task(
     if isinstance(llm_node, str):
         data.generated_text = llm_node
         text_ch.send_nowait(llm_node)
-        current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, data.generated_text)
+        current_span.set_attribute(
+            trace_types.ATTR_RESPONSE_TEXT,
+            await redact_for_telemetry(data.generated_text, redaction, role="assistant"),
+        )
         return True
 
     if not isinstance(llm_node, AsyncIterable):
@@ -287,11 +299,18 @@ async def _llm_inference_task(
         if isinstance(llm_node, _ACloseable):
             await llm_node.aclose()
 
-    current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, data.generated_text)
+    current_span.set_attribute(
+        trace_types.ATTR_RESPONSE_TEXT,
+        await redact_for_telemetry(data.generated_text, redaction, role="assistant"),
+    )
     current_span.set_attribute(
         trace_types.ATTR_RESPONSE_FUNCTION_CALLS,
-        json.dumps(
-            [fnc.model_dump(exclude={"type", "created_at"}) for fnc in data.generated_functions]
+        await redact_for_telemetry(
+            json.dumps(
+                [fnc.model_dump(exclude={"type", "created_at"}) for fnc in data.generated_functions]
+            ),
+            redaction,
+            role="assistant",
         ),
     )
     if data.ttft is not None:
@@ -820,12 +839,15 @@ async def _execute_tools_task(
                 async def _traceable_fnc_tool(
                     function_callable: Callable, fnc_call: llm.FunctionCall
                 ) -> None:
+                    redaction = session.options.redaction
                     current_span = trace.get_current_span()
                     current_span.set_attributes(
                         {
                             trace_types.ATTR_FUNCTION_TOOL_ID: fnc_call.call_id,
                             trace_types.ATTR_FUNCTION_TOOL_NAME: fnc_call.name,
-                            trace_types.ATTR_FUNCTION_TOOL_ARGS: fnc_call.arguments,
+                            trace_types.ATTR_FUNCTION_TOOL_ARGS: await redact_for_telemetry(
+                                fnc_call.arguments, redaction, role="tool"
+                            ),
                         }
                     )
 
@@ -852,7 +874,8 @@ async def _execute_tools_task(
 
                     if fnc_call_out := output.fnc_call_out:
                         current_span.set_attribute(
-                            trace_types.ATTR_FUNCTION_TOOL_OUTPUT, fnc_call_out.output
+                            trace_types.ATTR_FUNCTION_TOOL_OUTPUT,
+                            await redact_for_telemetry(fnc_call_out.output, redaction, role="tool"),
                         )
                         current_span.set_attribute(
                             trace_types.ATTR_FUNCTION_TOOL_IS_ERROR, fnc_call_out.is_error
